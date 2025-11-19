@@ -61,7 +61,6 @@ WORKDIR /app
 
 COPY --from=builder /app/vault-proxy /app/vault-proxy
 COPY --from=builder /usr/local/bin/gosu /usr/local/bin/gosu
-COPY config.yaml .
 
 EXPOSE 8080
 

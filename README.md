@@ -90,11 +90,8 @@ To support customer authentication (OIDC and username/password) and the OIDC Ide
 An admin can get their Google access token (the value for `X-Admin-Token`) using the `gcloud` CLI:
 
 ```bash
-# This command gets an OAuth 2.0 access token from your local gcloud auth
 export ADMIN_TOKEN=$(gcloud auth print-access-token)
-
-# Now you can use this token to make a proxied admin request to Vault
-curl -H "Authorization: Bearer <YOUR_VAULT_TOKEN>" \
+curl -H "X-Vault-Token: <YOUR_VAULT_TOKEN>" \
      -H "X-Admin-Token: $ADMIN_TOKEN" \
      http://localhost:8080/v1/sys/health
 ```
