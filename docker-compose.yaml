@@ -1,0 +1,13 @@
+networks:
+  default:
+
+services:
+  proxy:
+    image: libops/vault-proxy:main
+    build: .
+    networks:
+      default:
+    ports:
+      - 8080:8080
+    volumes:
+      - ./config.yaml:/app/config.yaml:r

@@ -1,0 +1,13 @@
+vault_addr: http://127.0.0.1:8200
+port: 8080
+admin_emails:
+  - me@example.com
+  - gsa@gcp-project.iam.gserviceaccount.com
+public_routes:
+  - /.well-known/
+  - /v1/identity/oidc/
+  - /v1/auth/oidc/
+  - /v1/auth/userpass/
+  # this should always be set, as the docker healthcheck relies on it
+  # the healthcheck checks both the proxy is working and vault is unsealed
+  - /v1/sys/health
