@@ -1,4 +1,4 @@
-name: build-push-ar
+name: lint-test-build-push
 on:
   push:
 jobs:
@@ -34,13 +34,12 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  build-push-ar:
+  build-push:
     needs: [test]
-    uses: libops/actions/.github/workflows/build-push.yml@main
+    uses: libops/.github/.github/workflows/build-push.yaml@main
     with:
-      image: "shared/vault-proxy"
+      docker-registry: "libops"
     permissions:
       contents: read
-      id-token: write
       packages: write
     secrets: inherit
