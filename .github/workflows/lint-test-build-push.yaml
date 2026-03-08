@@ -1,4 +1,4 @@
-name: build-push-ar
+name: lint-test-build-push
 on:
   push:
 jobs:
