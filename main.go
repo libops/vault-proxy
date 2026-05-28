@@ -79,8 +79,9 @@ func loadConfig(configPath string) (*Config, error) {
 	// Convert admin emails list to map for O(1) lookups
 	adminEmails := make(map[string]bool)
 	for _, email := range yamlConfig.AdminEmails {
+		email = normalizeEmail(email)
 		if email != "" {
-			adminEmails[strings.TrimSpace(email)] = true
+			adminEmails[email] = true
 		}
 	}
 
@@ -140,14 +141,36 @@ func validateAdminToken(ctx context.Context, tokenString string, adminEmails map
 	if err := json.NewDecoder(resp.Body).Decode(&tokenInfo); err != nil {
 		return false, fmt.Errorf("failed to parse tokeninfo response: %w", err)
 	}
-	if tokenInfo.EmailVerified != "true" {
-		return false, fmt.Errorf("email not verified")
-	}
-	if _, isAdmin := adminEmails[tokenInfo.Email]; !isAdmin {
-		return false, fmt.Errorf("non-admin hitting protected route")
+	if err := validateAdminIdentity(tokenInfo, adminEmails); err != nil {
+		return false, err
 	}
 
 	return true, nil
+}
+
+func validateAdminIdentity(tokenInfo TokenInfo, adminEmails map[string]bool) error {
+	email := normalizeEmail(tokenInfo.Email)
+	if email == "" {
+		return fmt.Errorf("token email missing")
+	}
+	if _, isAdmin := adminEmails[email]; !isAdmin {
+		return fmt.Errorf("non-admin hitting protected route")
+	}
+	if tokenInfo.EmailVerified == "true" {
+		return nil
+	}
+	if isGoogleServiceAccountEmail(email) {
+		return nil
+	}
+	return fmt.Errorf("email not verified")
+}
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func isGoogleServiceAccountEmail(email string) bool {
+	return strings.HasSuffix(normalizeEmail(email), ".gserviceaccount.com")
 }
 
 // createProxyHandler creates the main HTTP handler for the proxy.

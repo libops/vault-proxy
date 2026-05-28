@@ -294,6 +294,81 @@ func TestValidateAdminToken_Integration(t *testing.T) {
 	t.Skip("Requires refactoring validateAdminToken to be testable")
 }
 
+func TestValidateAdminIdentity(t *testing.T) {
+	adminEmails := map[string]bool{
+		"admin@example.com": true,
+		"api-production@libops-api.iam.gserviceaccount.com": true,
+	}
+
+	tests := []struct {
+		name        string
+		tokenInfo   TokenInfo
+		expectError bool
+		errorMsg    string
+	}{
+		{
+			name: "verified admin user",
+			tokenInfo: TokenInfo{
+				Email:         "admin@example.com",
+				EmailVerified: "true",
+			},
+			expectError: false,
+		},
+		{
+			name: "unverified admin user",
+			tokenInfo: TokenInfo{
+				Email:         "admin@example.com",
+				EmailVerified: "false",
+			},
+			expectError: true,
+			errorMsg:    "email not verified",
+		},
+		{
+			name: "unverified admin service account",
+			tokenInfo: TokenInfo{
+				Email:         "api-production@libops-api.iam.gserviceaccount.com",
+				EmailVerified: "false",
+			},
+			expectError: false,
+		},
+		{
+			name: "unverified non-admin service account",
+			tokenInfo: TokenInfo{
+				Email:         "other@libops-api.iam.gserviceaccount.com",
+				EmailVerified: "false",
+			},
+			expectError: true,
+			errorMsg:    "non-admin hitting protected route",
+		},
+		{
+			name: "missing email",
+			tokenInfo: TokenInfo{
+				EmailVerified: "true",
+			},
+			expectError: true,
+			errorMsg:    "token email missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateAdminIdentity(tt.tokenInfo, adminEmails)
+			if tt.expectError {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.errorMsg)
+				}
+				if tt.errorMsg != "" && !contains(err.Error(), tt.errorMsg) {
+					t.Fatalf("expected error containing %q, got %q", tt.errorMsg, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestMapsKeys(t *testing.T) {
 	tests := []struct {
 		name     string
