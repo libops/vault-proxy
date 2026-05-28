@@ -10,7 +10,7 @@ ARG \
     # renovate: datasource=repology depName=alpine_3_22/dpkg
     DPKG_VERSION=1.22.15-r0 \
     # renovate: datasource=repology depName=alpine_3_22/gnupg
-    GNUPG_VERSION=2.4.7-r0 \
+    GNUPG_VERSION=2.4.9-r0 \
     # renovate: datasource=github-releases depName=gosu packageName=tianon/gosu
     GOSU_VERSION=1.19
 
