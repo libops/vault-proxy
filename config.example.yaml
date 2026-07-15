@@ -4,10 +4,14 @@ admin_emails:
   - me@example.com
   - gsa@gcp-project.iam.gserviceaccount.com
 public_routes:
-  - /.well-known/
-  - /v1/identity/oidc/
-  - /v1/auth/oidc/
-  - /v1/auth/userpass/
-  # this should always be set, as the docker healthcheck relies on it
-  # the healthcheck checks both the proxy is working and vault is unsealed
+  - /.well-known/**
+  - /v1/identity/oidc/provider/*/.well-known/**
+  - /v1/identity/oidc/provider/*/authorize
+  - /v1/identity/oidc/provider/*/token
+  - /v1/identity/oidc/provider/*/userinfo
+  - /ui/vault/identity/oidc/provider/*/authorize
+  - /v1/auth/oidc/oidc/auth_url
+  - /v1/auth/oidc/oidc/callback
+  - /ui/vault/auth/*/oidc/callback
+  - /v1/auth/userpass/login/**
   - /v1/sys/health

@@ -1,69 +1,26 @@
-FROM golang:1.25-alpine3.22@sha256:d3f0cf7723f3429e3f9ed846243970b20a2de7bae6a5b66fc5914e228d831bbb AS builder
+FROM ghcr.io/libops/go:1.26.5@sha256:ea764e85e42a243217c621891123b3fda9374674c29d59785414fc6b15815b3d AS builder
 
-SHELL ["/bin/ash", "-o", "pipefail", "-ex", "-c"]
-
-WORKDIR /app
-
-ARG \
-    # renovate: datasource=repology depName=alpine_3_22/ca-certificates
-    CA_CERTIFICATES_VERSION=20250911-r0 \
-    # renovate: datasource=repology depName=alpine_3_22/dpkg
-    DPKG_VERSION=1.22.15-r0 \
-    # renovate: datasource=repology depName=alpine_3_22/gnupg
-    GNUPG_VERSION=2.4.9-r0 \
-    # renovate: datasource=github-releases depName=gosu packageName=tianon/gosu
-    GOSU_VERSION=1.19
-
-RUN apk add --no-cache --virtual .gosu-deps \
-    ca-certificates=="${CA_CERTIFICATES_VERSION}" \
-    dpkg=="${DPKG_VERSION}" \
-    gnupg=="${GNUPG_VERSION}" && \
-    dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')" && \
-    wget -q -O /usr/local/bin/gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch" && \
-    wget -q -O /usr/local/bin/gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc" && \
-    GNUPGHOME="$(mktemp -d)" && \
-    export GNUPGHOME && \
-    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4 && \
-    gpg --batch --verify /usr/local/bin/gosu.asc /usr/local/bin/gosu && \
-    gpgconf --kill all && \
-    rm -rf "$GNUPGHOME" /usr/local/bin/gosu.asc && \
-    apk del --no-network .gosu-deps && \
-    chmod +x /usr/local/bin/gosu && \
-    echo "gosu install complete."
+WORKDIR /src
 
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
-    go mod download
+    go mod download && \
+    go mod verify
 
 COPY main.go ./
 
+ARG TARGETOS=linux
+ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
-    CGO_ENABLED=0 go build -ldflags="-s -w" -o /app/vault-proxy .
+    CGO_ENABLED=0 GOOS="${TARGETOS}" GOARCH="${TARGETARCH}" \
+    go build -buildvcs=false -trimpath -ldflags="-s -w" -o /out/vault-proxy .
 
-FROM alpine:3.22@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412
+FROM scratch
 
-SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /out/vault-proxy /vault-proxy
 
-ARG \
-    # renovate: datasource=repology depName=alpine_3_22/curl
-    CURL_VERSION=8.14.1-r2 \
-    # renovate: datasource=repology depName=alpine_3_22/jq
-    JQ_VERSION=1.8.1-r0
-
-
-RUN apk add --no-cache \
-    curl=="${CURL_VERSION}" \
-    jq=="${JQ_VERSION}"
-
-RUN adduser -S -G nobody -u 8080 vault-proxy
-
-WORKDIR /app
-
-COPY --from=builder /app/vault-proxy /app/vault-proxy
-COPY --from=builder /usr/local/bin/gosu /usr/local/bin/gosu
-
+USER 65532:65532
 EXPOSE 8080
 
-ENTRYPOINT ["gosu", "vault-proxy", "/app/vault-proxy", "-config", "/app/config.yaml"]
-
-HEALTHCHECK CMD curl -sf http://localhost:8080/v1/sys/health | jq .sealed | grep -q false
+ENTRYPOINT ["/vault-proxy"]

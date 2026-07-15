@@ -1,45 +1,136 @@
-name: lint-test-build-push
+name: build-push
+
 on:
+  workflow_call:
+    secrets:
+      CODECOV_TOKEN:
+        required: false
+      GCLOUD_OIDC_POOL:
+        required: false
+      GSA:
+        required: false
+  pull_request:
   push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
-  test:
-    permissions:
-      contents: read
+  lint-test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          go-version: ">=1.25.0"
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: golangci-lint
-        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          version: latest
+          go-version-file: go.mod
 
-      - name: Install dependencies
-        run: go get .
+      - name: Download and verify modules
+        run: |
+          go mod download
+          go mod verify
+          go mod tidy -diff
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.12.2
+
+      - name: Test
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Build
-        run: go build -v
+        run: go build -trimpath ./...
 
-      - name: Test with the Go CLI
-        run: go test -v -race -coverprofile=coverage.out -covermode=atomic .
+      - name: Validate release configuration
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          args: check
 
-      - name: upload coverage to codecov
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6
+      - name: Exercise snapshot release
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          args: release --snapshot --clean
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           files: ./coverage.out
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  build-push:
-    needs: [test]
-    uses: libops/.github/.github/workflows/build-push.yaml@d7f0ba06b4c8a1f8559892ea65a0b1af4d024dd3 # main
+  image-check:
+    if: github.event_name == 'pull_request'
+    strategy:
+      matrix:
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3
+
+      - name: Resolve native platform
+        id: platform
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            X64) platform=amd64 ;;
+            ARM64) platform=arm64 ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          echo "name=$platform" >> "$GITHUB_OUTPUT"
+
+      - name: Build native image without credentials
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6
+        with:
+          context: .
+          load: true
+          platforms: linux/${{ steps.platform.outputs.name }}
+          provenance: false
+          push: false
+          tags: vault-proxy:ci-${{ steps.platform.outputs.name }}
+
+      - name: Scan native image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: vault-proxy:ci-${{ steps.platform.outputs.name }}
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+          vuln-type: os,library
+
+  publish:
+    if: github.event_name != 'pull_request'
+    needs: [lint-test]
+    uses: libops/.github/.github/workflows/build-push.yaml@578137212ead4ab4059e95df17fa30e9b7ac4aed # guarded-signed-image-publisher
     with:
-      docker-registry: "libops"
+      ref: ${{ github.sha }}
+      expected-main-sha: ${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+      additional-gar-registry: us-docker.pkg.dev/libops-images/public
+      scan: true
+      sign: true
+      certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@578137212ead4ab4059e95df17fa30e9b7ac4aed
     permissions:
       contents: read
       packages: write
-    secrets: inherit
+      id-token: write
+    secrets:
+      GCLOUD_OIDC_POOL: ${{ secrets.GCLOUD_OIDC_POOL }}
+      GSA: ${{ secrets.GSA }}

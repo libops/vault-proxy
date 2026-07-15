@@ -1,97 +1,88 @@
-# Lightweight Go Proxy for Vault
+# Vault proxy
 
-This is a lightweight reverse proxy designed to sit in front of a HashiCorp Vault instance. It adds an additional authorization layer for admin access while allowing specific OIDC-related routes to be public.
+Vault proxy is the public Cloud Run sidecar for the LibOps Vault service. Vault
+continues to authorize every Vault token and policy; the proxy adds a Google
+administrator check to routes that are not explicitly required by customer
+authentication or secret access flows.
 
-## Security Logic
+## Request policy
 
-This proxy implements the following logic for every incoming request:
+- `GET /healthz` checks only that the proxy process can serve requests.
+- A configured public route is forwarded without a Google administrator token.
+- Every other route requires a valid Google access token in `X-Admin-Token`
+  whose verified email is in `admin_emails`.
+- `X-Admin-Token` is always removed before forwarding. Vault credentials such
+  as `X-Vault-Token` and `Authorization` are preserved.
+- Authentication failures return a generic `401`; logs record the denied path
+  without the Google credential or token-validation details.
 
-1. **Public Routes**: The request path is checked against a list of public route prefixes (defined in `config.yaml`). If it matches, the request is forwarded directly to Vault without any checks.
-
-2. **Protected Routes**: If the path is not public, the proxy requires the request to have a header named `X-Admin-Token`.
-
-3. **Token Validation**: The value of this header MUST be a valid Google OAuth 2.0 access token. The proxy validates the token by calling Google's tokeninfo endpoint to verify:
-   - The token is valid and not expired
-   - The email claim is present and verified
-
-4. **Admin Check**: After the token is proven valid, the proxy checks the `email` and `email_verified` claims. If `email_verified` is true and the email is in the admin list, access is granted.
-
-5. **Access Denied**: If the header is missing, the token is invalid, or the user is not in the admin list, the proxy returns a `401 Unauthorized` or `403 Forbidden` error.
-
-6. **Forwarding**: If access is granted, the `X-Admin-Token` header is removed from the request, and the original request (including any original `Authorization` header containing a Vault token) is forwarded to Vault.
-
-This allows an admin to make an authenticated Vault API request while proving their identity to the proxy simultaneously.
+Version 2 replaces unsafe implicit prefixes with explicit path patterns. A
+literal path matches exactly, `*` matches one complete segment, and a final
+`/**` matches a subtree. For example,
+`/v1/auth/userpass/login/**` permits login requests but does not expose
+`/v1/auth/userpass/users/**`. Legacy routes ending in `/` are rejected so an
+upgrade cannot silently retain the broader policy.
 
 ## Configuration
 
-Configuration is managed via either a YAML file or the `VAULT_PROXY_YAML` environment variable.
-
-### Option 1: YAML File
-
-Create a `config.yaml` file:
+Set `VAULT_PROXY_YAML` or pass `-config /path/to/config.yaml`. Environment
+configuration takes precedence. Unknown YAML fields, multiple YAML documents,
+invalid ports, non-HTTP(S) upstreams, malformed emails, and invalid route
+patterns fail startup.
 
 ```yaml
-vault_addr: "http://127.0.0.1:8200"
+vault_addr: http://127.0.0.1:8200
 port: 8080
 admin_emails:
-  - admin@mycorp.com
-  - ops@mycorp.com
+  - admin@example.com
 public_routes:
-  - /.well-known/
-  - /v1/identity/oidc/
-  - /v1/auth/oidc/
-  - /v1/auth/userpass/
+  - /.well-known/**
+  - /v1/identity/oidc/provider/*/.well-known/**
+  - /v1/identity/oidc/provider/*/authorize
+  - /v1/identity/oidc/provider/*/token
+  - /v1/identity/oidc/provider/*/userinfo
+  - /ui/vault/identity/oidc/provider/*/authorize
+  - /v1/auth/oidc/oidc/auth_url
+  - /v1/auth/oidc/oidc/callback
+  - /ui/vault/auth/*/oidc/callback
+  - /v1/auth/userpass/login/**
   - /v1/sys/health
 ```
 
-### Option 2: Environment Variable
+The example patterns permit OIDC discovery/exchange and user login while
+leaving role, provider, user, policy, and system management protected. Add
+secret-engine subtrees only when downstream Vault policies are intended to be
+the authorization boundary for those paths.
 
-Set the `VAULT_PROXY_YAML` environment variable with the YAML configuration as a string:
+The provider paths follow Vault's
+[OIDC provider API](https://developer.hashicorp.com/vault/api-docs/secret/identity/oidc-provider),
+and the auth-method callback paths follow the
+[JWT/OIDC auth API](https://developer.hashicorp.com/vault/api-docs/auth/jwt).
 
-```bash
-export VAULT_PROXY_YAML='
-vault_addr: "http://127.0.0.1:8200"
-port: 8080
-admin_emails:
-  - admin@mycorp.com
-  - ops@mycorp.com
-public_routes:
-  - /.well-known/
-  - /v1/identity/oidc/
-  - /v1/auth/oidc/
-  - /v1/auth/userpass/
-  - /v1/sys/health
-'
+An administrator can supply a Google access token while independently passing
+a Vault token:
+
+```sh
+curl \
+  -H "X-Admin-Token: $(gcloud auth print-access-token)" \
+  -H "X-Vault-Token: ${VAULT_TOKEN}" \
+  https://vault.example.com/v1/sys/policies/acl
 ```
 
-**Note**: If `VAULT_PROXY_YAML` is set, it takes precedence over the `-config` flag.
+Service-account access tokens must include the
+`https://www.googleapis.com/auth/userinfo.email` scope so Google's tokeninfo
+response contains the verified service-account email. Tokens without that
+identity claim fail closed.
 
-### Configuration Fields
+## Images and releases
 
-| Field | Required | Description |
-|-------|----------|-------------|
-| `vault_addr` | Yes | The full URL of the upstream Vault server (e.g., `http://127.0.0.1:8200`) |
-| `admin_emails` | Yes | List of Google email addresses that are allowed admin access |
-| `public_routes` | No | List of URL prefixes to allow through without any checks |
-| `port` | No | The port for this proxy to listen on. Defaults to `8080` |
+Pull requests build, test, lint, build both native image architectures, and
+scan them without registry credentials. Protected `main` and release tags use
+the LibOps shared publisher to publish and keylessly sign the same manifest in:
 
-### Example Public Routes
+- `ghcr.io/libops/vault-proxy`
+- `us-docker.pkg.dev/libops-images/public/vault-proxy`
 
-To support customer authentication (OIDC and username/password) and the OIDC Identity Broker flow, these paths should be public:
-
-- `/.well-known/`: For OIDC discovery (e.g., `/.well-known/openid-configuration`)
-- `/v1/identity/oidc/`: For Vault's OIDC provider endpoints (like `/authorize` and `/token`)
-- `/v1/auth/oidc/`: For OIDC authentication endpoints (login, callback)
-- `/v1/auth/userpass/`: For username/password authentication endpoints
-- `/v1/sys/health`: For Vault health checks (monitoring, load balancers)
-
-## How to Get an Admin Token
-
-An admin can get their Google access token (the value for `X-Admin-Token`) using the `gcloud` CLI:
-
-```bash
-export ADMIN_TOKEN=$(gcloud auth print-access-token)
-curl -H "X-Vault-Token: <YOUR_VAULT_TOKEN>" \
-     -H "X-Admin-Token: $ADMIN_TOKEN" \
-     http://localhost:8080/v1/sys/health
-```
+Cloud Run deployments must use the GAR image pinned by digest. Other consumers
+should use GHCR and may also pin the signed digest. Repository releases use PR
+title markers (`[major]`, `[minor]`, or the default patch increment).

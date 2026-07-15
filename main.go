@@ -1,21 +1,37 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
+	"net/mail"
 	"net/url"
 	"os"
+	"os/signal"
+	"path"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// YAMLConfig represents the structure of the YAML configuration file.
+const (
+	defaultListenPort = 8080
+	// #nosec G101 -- this is Google's public token-inspection endpoint, not a credential.
+	defaultTokenInfoURL = "https://oauth2.googleapis.com/tokeninfo"
+	maxTokenInfoBody    = 1 << 20
+)
+
+// YAMLConfig represents the supported configuration file fields.
 type YAMLConfig struct {
 	VaultAddr    string   `yaml:"vault_addr"`
 	Port         int      `yaml:"port"`
@@ -23,233 +39,333 @@ type YAMLConfig struct {
 	PublicRoutes []string `yaml:"public_routes"`
 }
 
-// Config holds all configuration for the proxy, loaded from YAML.
+// Config is the validated runtime configuration.
 type Config struct {
 	VaultTargetURL *url.URL
 	PublicRoutes   []string
-	AdminEmails    map[string]bool // Use a map for fast O(1) lookups
-	ListenPort     string
+	AdminEmails    map[string]struct{}
+	ListenPort     int
 }
 
-// loadYAMLConfig loads configuration from a YAML file or VAULT_PROXY_YAML env var.
+// TokenInfo is the subset of Google's tokeninfo response used for access
+// control. Google rejects expired or invalid access tokens before returning it.
+type TokenInfo struct {
+	Email         string `json:"email"`
+	EmailVerified string `json:"email_verified"`
+}
+
+type tokenValidator interface {
+	Validate(context.Context, string, map[string]struct{}) error
+}
+
+type googleTokenValidator struct {
+	client   *http.Client
+	endpoint string
+}
+
 func loadYAMLConfig(configPath string) (*YAMLConfig, error) {
 	var data []byte
 	var err error
 
-	// Check for VAULT_PROXY_YAML environment variable first
 	if yamlEnv := os.Getenv("VAULT_PROXY_YAML"); yamlEnv != "" {
 		data = []byte(yamlEnv)
 	} else if configPath != "" {
+		// #nosec G304 -- the operator explicitly selects the configuration path;
+		// the process runs non-root and the container filesystem is read-only.
 		data, err = os.ReadFile(configPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read config file: %w", err)
+			return nil, fmt.Errorf("read config file: %w", err)
 		}
 	} else {
-		return nil, fmt.Errorf("either VAULT_PROXY_YAML environment variable or -config flag must be set")
+		return nil, errors.New("either VAULT_PROXY_YAML or -config must be set")
 	}
 
-	var yamlConfig YAMLConfig
-	if err := yaml.Unmarshal(data, &yamlConfig); err != nil {
-		return nil, fmt.Errorf("failed to parse YAML config: %w", err)
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	var config YAMLConfig
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("parse YAML config: %w", err)
 	}
-
-	return &yamlConfig, nil
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("parse YAML config: multiple documents are not allowed")
+		}
+		return nil, fmt.Errorf("parse YAML config: %w", err)
+	}
+	return &config, nil
 }
 
-// loadConfig loads configuration from YAML file or VAULT_PROXY_YAML env var.
 func loadConfig(configPath string) (*Config, error) {
 	yamlConfig, err := loadYAMLConfig(configPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load YAML config: %w", err)
+		return nil, err
 	}
 
-	// Validate required fields
-	if yamlConfig.VaultAddr == "" {
-		return nil, fmt.Errorf("vault_addr must be set in config file")
-	}
-	targetURL, err := url.Parse(yamlConfig.VaultAddr)
+	targetURL, err := validateVaultURL(yamlConfig.VaultAddr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid vault_addr: %w", err)
+		return nil, err
 	}
 
-	if len(yamlConfig.AdminEmails) == 0 {
-		return nil, fmt.Errorf("admin_emails must contain at least one email")
+	adminEmails := make(map[string]struct{}, len(yamlConfig.AdminEmails))
+	for _, configuredEmail := range yamlConfig.AdminEmails {
+		email := normalizeEmail(configuredEmail)
+		parsed, parseErr := mail.ParseAddress(email)
+		if email == "" || parseErr != nil || normalizeEmail(parsed.Address) != email {
+			return nil, fmt.Errorf("invalid admin email %q", configuredEmail)
+		}
+		adminEmails[email] = struct{}{}
+	}
+	if len(adminEmails) == 0 {
+		return nil, errors.New("admin_emails must contain at least one valid email")
 	}
 
-	// Convert admin emails list to map for O(1) lookups
-	adminEmails := make(map[string]bool)
-	for _, email := range yamlConfig.AdminEmails {
-		email = normalizeEmail(email)
-		if email != "" {
-			adminEmails[email] = true
+	for _, route := range yamlConfig.PublicRoutes {
+		if err := validatePublicRoutePattern(route); err != nil {
+			return nil, err
 		}
 	}
 
 	port := yamlConfig.Port
 	if port == 0 {
-		port = 8080
+		port = defaultListenPort
+	}
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("port must be between 1 and 65535, got %d", port)
 	}
 
 	return &Config{
 		VaultTargetURL: targetURL,
-		PublicRoutes:   yamlConfig.PublicRoutes,
+		PublicRoutes:   append([]string(nil), yamlConfig.PublicRoutes...),
 		AdminEmails:    adminEmails,
-		ListenPort:     fmt.Sprintf("%d", port),
+		ListenPort:     port,
 	}, nil
 }
 
-// isPublicRoute checks if a given request path matches any of the public route prefixes.
-func isPublicRoute(path string, publicRoutes []string) bool {
-	for _, route := range publicRoutes {
-		if strings.HasPrefix(path, route) {
+func validateVaultURL(rawURL string) (*url.URL, error) {
+	if strings.TrimSpace(rawURL) != rawURL || rawURL == "" {
+		return nil, errors.New("vault_addr must be a non-empty absolute URL")
+	}
+	targetURL, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid vault_addr: %w", err)
+	}
+	if (targetURL.Scheme != "http" && targetURL.Scheme != "https") || targetURL.Host == "" {
+		return nil, errors.New("vault_addr must use http or https and include a host")
+	}
+	if targetURL.User != nil || targetURL.RawQuery != "" || targetURL.Fragment != "" {
+		return nil, errors.New("vault_addr must not contain credentials, a query, or a fragment")
+	}
+	if targetURL.Path != "" && targetURL.Path != "/" {
+		return nil, errors.New("vault_addr must not contain a path")
+	}
+	return targetURL, nil
+}
+
+// Public route patterns are deliberately narrower than the legacy prefix
+// rules. A literal path is exact, '*' matches one complete path segment, and a
+// final '/**' matches the named subtree. Other wildcard forms are rejected.
+func validatePublicRoutePattern(pattern string) error {
+	if pattern == "" || !strings.HasPrefix(pattern, "/") || pattern != path.Clean(pattern) {
+		return fmt.Errorf("public route %q must be a canonical absolute path", pattern)
+	}
+	segments := strings.Split(strings.TrimPrefix(pattern, "/"), "/")
+	for i, segment := range segments {
+		if segment == "**" {
+			if i != len(segments)-1 || i == 0 {
+				return fmt.Errorf("public route %q may use ** only as its final segment", pattern)
+			}
+			continue
+		}
+		if segment == "*" {
+			continue
+		}
+		if segment == "" || strings.ContainsAny(segment, "*?[]\\") {
+			return fmt.Errorf("public route %q contains an invalid segment", pattern)
+		}
+	}
+	return nil
+}
+
+func isPublicRoute(requestPath string, publicRoutes []string) bool {
+	if requestPath == "" || requestPath != path.Clean(requestPath) {
+		return false
+	}
+	for _, pattern := range publicRoutes {
+		if strings.HasSuffix(pattern, "/**") {
+			base := strings.TrimSuffix(pattern, "/**")
+			if requestPath == base || strings.HasPrefix(requestPath, base+"/") {
+				return true
+			}
+			continue
+		}
+		matched, err := path.Match(pattern, requestPath)
+		if err == nil && matched {
 			return true
 		}
 	}
 	return false
 }
 
-// TokenInfo represents the response from Google's tokeninfo endpoint.
-type TokenInfo struct {
-	Email         string `json:"email"`
-	EmailVerified string `json:"email_verified"`
-	ExpiresIn     string `json:"expires_in"`
-	Scope         string `json:"scope"`
-}
-
-// validateAdminToken validates a Google OAuth 2.0 access token.
-// It calls Google's tokeninfo endpoint to verify the token and extract email.
-func validateAdminToken(ctx context.Context, tokenString string, adminEmails map[string]bool) (bool, error) {
-	// Call Google's tokeninfo endpoint to validate the access token
-	tokenInfoURL := "https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=" + url.QueryEscape(tokenString)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", tokenInfoURL, nil)
-	if err != nil {
-		return false, fmt.Errorf("failed to create tokeninfo request: %w", err)
+func (validator googleTokenValidator) Validate(ctx context.Context, token string, adminEmails map[string]struct{}) error {
+	if token == "" {
+		return errors.New("admin token missing")
 	}
-
-	resp, err := http.DefaultClient.Do(req)
+	endpoint, err := url.Parse(validator.endpoint)
 	if err != nil {
-		return false, fmt.Errorf("failed to call tokeninfo endpoint: %w", err)
+		return errors.New("token validator is misconfigured")
+	}
+	query := endpoint.Query()
+	query.Set("access_token", token)
+	endpoint.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		// The parsed URL contains the access token as a query parameter. Do not
+		// wrap errors that can reproduce that URL in their text.
+		return errors.New("create tokeninfo request failed")
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := validator.client.Do(req)
+	if err != nil {
+		// http.Client errors commonly include the complete request URL. Returning
+		// the transport error would make the Google credential loggable by the
+		// caller because tokeninfo receives it in the query string.
+		return errors.New("tokeninfo request failed")
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("tokeninfo returned status %d", resp.StatusCode)
+		return fmt.Errorf("tokeninfo rejected token with status %d", resp.StatusCode)
 	}
 
 	var tokenInfo TokenInfo
-	if err := json.NewDecoder(resp.Body).Decode(&tokenInfo); err != nil {
-		return false, fmt.Errorf("failed to parse tokeninfo response: %w", err)
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, maxTokenInfoBody))
+	if err := decoder.Decode(&tokenInfo); err != nil {
+		return fmt.Errorf("parse tokeninfo response: %w", err)
 	}
-	if err := validateAdminIdentity(tokenInfo, adminEmails); err != nil {
-		return false, err
-	}
-
-	return true, nil
+	return validateAdminIdentity(tokenInfo, adminEmails)
 }
 
-func validateAdminIdentity(tokenInfo TokenInfo, adminEmails map[string]bool) error {
+func validateAdminIdentity(tokenInfo TokenInfo, adminEmails map[string]struct{}) error {
 	email := normalizeEmail(tokenInfo.Email)
 	if email == "" {
-		return fmt.Errorf("token email missing")
+		return errors.New("token email missing")
 	}
 	if _, isAdmin := adminEmails[email]; !isAdmin {
-		return fmt.Errorf("non-admin hitting protected route")
+		return errors.New("token identity is not an administrator")
 	}
-	if tokenInfo.EmailVerified == "true" {
-		return nil
+	verified, err := strconv.ParseBool(tokenInfo.EmailVerified)
+	if err != nil || !verified {
+		return errors.New("token email is not verified")
 	}
-	if isGoogleServiceAccountEmail(email) {
-		return nil
-	}
-	return fmt.Errorf("email not verified")
+	return nil
 }
 
 func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
-func isGoogleServiceAccountEmail(email string) bool {
-	return strings.HasSuffix(normalizeEmail(email), ".gserviceaccount.com")
+func createProxyHandler(config *Config) http.Handler {
+	validator := googleTokenValidator{
+		client:   &http.Client{Timeout: 10 * time.Second},
+		endpoint: defaultTokenInfoURL,
+	}
+	return createProxyHandlerWithValidator(config, validator)
 }
 
-// createProxyHandler creates the main HTTP handler for the proxy.
-func createProxyHandler(config *Config) http.Handler {
-	// Create the reverse proxy that will forward to Vault
-	proxy := httputil.NewSingleHostReverseProxy(config.VaultTargetURL)
-
-	proxy.Director = func(req *http.Request) {
-		req.URL.Scheme = config.VaultTargetURL.Scheme
-		req.URL.Host = config.VaultTargetURL.Host
-		req.Host = config.VaultTargetURL.Host
+func createProxyHandlerWithValidator(config *Config, validator tokenValidator) http.Handler {
+	proxy := &httputil.ReverseProxy{}
+	proxy.Rewrite = func(request *httputil.ProxyRequest) {
+		// Rewrite mode removes the standard client-provided Forwarded and
+		// X-Forwarded-* values before this function runs. Remove extensions as
+		// well and do not reconstruct them: Vault must not make authorization or
+		// audit decisions using an attacker-supplied client IP, host, or scheme.
+		for header := range request.Out.Header {
+			normalized := strings.ToLower(header)
+			if normalized == "forwarded" || normalized == "x-real-ip" || strings.HasPrefix(normalized, "x-forwarded-") {
+				request.Out.Header.Del(header)
+			}
+		}
+		request.SetURL(config.VaultTargetURL)
+		request.Out.Host = request.Out.URL.Host
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, err error) {
+		slog.Error("vault upstream request failed", "error", err)
+		http.Error(w, "Vault upstream unavailable", http.StatusBadGateway)
 	}
 
-	// Return the main handler function
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// Capture and remove the proxy credential before every forwarding path,
+		// including public routes. Vault must never receive this Google token.
+		token := r.Header.Get("X-Admin-Token")
+		r.Header.Del("X-Admin-Token")
+
 		if isPublicRoute(r.URL.Path, config.PublicRoutes) {
-			slog.Info(r.Method, "path", r.URL.Path)
+			slog.Info("forwarding public Vault route", "method", r.Method, "path", r.URL.Path)
 			proxy.ServeHTTP(w, r)
 			return
 		}
-
-		token := r.Header.Get("X-Admin-Token")
 		if token == "" {
-			slog.Warn("access denied: missing header", "path", r.URL.Path, "status", 401)
-			http.Error(w, "Access Denied: Missing X-Admin-Token header", http.StatusUnauthorized)
+			slog.Warn("protected Vault route denied", "path", r.URL.Path, "reason", "missing admin token")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-
-		isValid, err := validateAdminToken(r.Context(), token, config.AdminEmails)
-		if err != nil {
-			slog.Warn("access denied: token validation error", "path", r.URL.Path, "error", err, "status", 401)
-			http.Error(w, fmt.Sprintf("Token Validation Error: %v", err), http.StatusUnauthorized)
+		if err := validator.Validate(r.Context(), token, config.AdminEmails); err != nil {
+			// Validator errors are intentionally not logged. A transport error may
+			// contain a token-bearing request URL, and authentication details are not
+			// needed to record the denied path.
+			slog.Warn("protected Vault route denied", "path", r.URL.Path, "reason", "token validation failed")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-
-		if !isValid {
-			slog.Warn("access denied: user not admin", "path", r.URL.Path, "status", 403)
-			http.Error(w, "Access Denied: User is not an admin", http.StatusForbidden)
-			return
-		}
-
-		r.Header.Del("X-Admin-Token")
-
-		// Forward the request to Vault
 		proxy.ServeHTTP(w, r)
 	})
 }
 
 func main() {
-	// Parse command-line flags
-	configPath := flag.String("config", "", "Path to YAML configuration file (optional if VAULT_PROXY_YAML is set)")
+	configPath := flag.String("config", "", "path to YAML configuration (optional when VAULT_PROXY_YAML is set)")
 	flag.Parse()
 
-	// Load configuration from YAML file or VAULT_PROXY_YAML env var
 	config, err := loadConfig(*configPath)
 	if err != nil {
 		slog.Error("failed to load configuration", "error", err)
 		os.Exit(1)
 	}
 
-	slog.Info("starting vault proxy",
-		"port", config.ListenPort,
-		"vault_addr", config.VaultTargetURL.String(),
-		"admin_emails", mapsKeys(config.AdminEmails),
-		"public_routes", config.PublicRoutes)
-
-	// Create the handler and start the server
-	handler := createProxyHandler(config)
-	if err := http.ListenAndServe(":"+config.ListenPort, handler); err != nil {
-		slog.Error("failed to start server", "error", err)
-		os.Exit(1)
+	server := &http.Server{
+		Addr:              fmt.Sprintf(":%d", config.ListenPort),
+		Handler:           createProxyHandler(config),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       90 * time.Second,
 	}
-}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-// Helper function to get keys from a map for logging
-func mapsKeys(m map[string]bool) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	serverErrors := make(chan error, 1)
+	go func() {
+		slog.Info("starting vault proxy", "port", config.ListenPort, "vault_addr", config.VaultTargetURL.Redacted(), "admin_count", len(config.AdminEmails), "public_routes", config.PublicRoutes)
+		serverErrors <- server.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("vault proxy stopped", "error", err)
+			os.Exit(1)
+		}
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			slog.Error("vault proxy shutdown failed", "error", err)
+			os.Exit(1)
+		}
 	}
-	return keys
 }
