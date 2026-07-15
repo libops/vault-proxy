@@ -1,424 +1,418 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
+type tokenValidatorFunc func(context.Context, string, map[string]struct{}) error
+
+func (fn tokenValidatorFunc) Validate(ctx context.Context, token string, admins map[string]struct{}) error {
+	return fn(ctx, token, admins)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 func TestIsPublicRoute(t *testing.T) {
-	publicRoutes := []string{
-		"/.well-known/",
-		"/v1/identity/oidc/",
-		"/v1/auth/oidc/",
-		"/v1/auth/userpass/",
+	routes := []string{
+		"/.well-known/**",
+		"/v1/identity/oidc/provider/*/authorize",
+		"/v1/auth/userpass/login/**",
+		"/v1/sys/health",
 	}
-
 	tests := []struct {
-		name     string
-		path     string
-		expected bool
+		path string
+		want bool
 	}{
-		{"well-known exact", "/.well-known/", true},
-		{"well-known subpath", "/.well-known/openid-configuration", true},
-		{"identity oidc", "/v1/identity/oidc/authorize", true},
-		{"auth oidc", "/v1/auth/oidc/login", true},
-		{"userpass login", "/v1/auth/userpass/login/alice", true},
-		{"protected route", "/v1/sys/health", false},
-		{"protected secrets", "/v1/secret/data/myapp", false},
-		{"root path", "/", false},
-		{"similar but not matching", "/v1/auth/token/create", false},
+		{"/.well-known/openid-configuration", true},
+		{"/v1/identity/oidc/provider/default/authorize", true},
+		{"/v1/identity/oidc/provider/default/config", false},
+		{"/v1/auth/userpass/login", true},
+		{"/v1/auth/userpass/login/alice", true},
+		{"/v1/auth/userpass/users/alice", false},
+		{"/v1/sys/health", true},
+		{"/v1/sys/health/extra", false},
+		{"/v1/sys/healthcheck", false},
+		{"/v1/auth/userpass/login/../users/alice", false},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isPublicRoute(tt.path, publicRoutes)
-			if result != tt.expected {
-				t.Errorf("isPublicRoute(%q) = %v, expected %v", tt.path, result, tt.expected)
+	for _, test := range tests {
+		t.Run(test.path, func(t *testing.T) {
+			if got := isPublicRoute(test.path, routes); got != test.want {
+				t.Fatalf("isPublicRoute(%q) = %v, want %v", test.path, got, test.want)
 			}
 		})
+	}
+}
+
+func TestValidatePublicRoutePattern(t *testing.T) {
+	for _, pattern := range []string{
+		"/v1/sys/health",
+		"/v1/auth/userpass/login/**",
+		"/v1/identity/oidc/provider/*/authorize",
+	} {
+		if err := validatePublicRoutePattern(pattern); err != nil {
+			t.Errorf("valid pattern %q rejected: %v", pattern, err)
+		}
+	}
+	for _, pattern := range []string{
+		"v1/sys/health",
+		"/v1/auth/oidc/",
+		"/v1/**/config",
+		"/v1/auth*",
+		"/v1//health",
+		"/v1/../sys/health",
+	} {
+		if err := validatePublicRoutePattern(pattern); err == nil {
+			t.Errorf("invalid pattern %q accepted", pattern)
+		}
 	}
 }
 
 func TestLoadConfig(t *testing.T) {
 	tests := []struct {
-		name        string
-		configYAML  string
-		expectError bool
-		errorMsg    string
+		name       string
+		yaml       string
+		wantPort   int
+		wantErr    string
+		wantAdmins int
 	}{
 		{
-			name: "valid config",
-			configYAML: `vault_addr: "http://127.0.0.1:8200"
-port: 8080
+			name: "valid and normalized",
+			yaml: `vault_addr: http://127.0.0.1:8200
 admin_emails:
+  - Admin@Example.com
   - admin@example.com
-  - ops@example.com
 public_routes:
-  - /.well-known/
-  - /v1/auth/oidc/
+  - /v1/sys/health
 `,
-			expectError: false,
+			wantPort:   8080,
+			wantAdmins: 1,
 		},
 		{
-			name: "missing vault_addr",
-			configYAML: `port: 8080
-admin_emails:
-  - admin@example.com
+			name: "explicit port",
+			yaml: `vault_addr: https://vault.example.com
+port: 8443
+admin_emails: [admin@example.com]
 `,
-			expectError: true,
-			errorMsg:    "vault_addr must be set",
+			wantPort:   8443,
+			wantAdmins: 1,
 		},
-		{
-			name: "missing admin_emails",
-			configYAML: `vault_addr: "http://127.0.0.1:8200"
-port: 8080
-`,
-			expectError: true,
-			errorMsg:    "admin_emails must contain at least one email",
-		},
-		{
-			name: "invalid vault_addr URL",
-			configYAML: `vault_addr: "://invalid-url"
-port: 8080
-admin_emails:
-  - admin@example.com
-`,
-			expectError: true,
-			errorMsg:    "invalid vault_addr",
-		},
-		{
-			name: "port defaults to 8080",
-			configYAML: `vault_addr: "http://127.0.0.1:8200"
-admin_emails:
-  - admin@example.com
-`,
-			expectError: false,
-		},
+		{name: "unknown field", yaml: "vault_addr: http://vault:8200\nadmin_emails: [admin@example.com]\nsurprise: true\n", wantErr: "field surprise not found"},
+		{name: "relative URL", yaml: "vault_addr: vault:8200\nadmin_emails: [admin@example.com]\n", wantErr: "must use http or https"},
+		{name: "URL credentials", yaml: "vault_addr: https://user:pass@vault.example.com\nadmin_emails: [admin@example.com]\n", wantErr: "must not contain credentials"},
+		{name: "URL path", yaml: "vault_addr: https://vault.example.com/v1\nadmin_emails: [admin@example.com]\n", wantErr: "must not contain a path"},
+		{name: "empty admins", yaml: "vault_addr: http://vault:8200\nadmin_emails: ['   ']\n", wantErr: "invalid admin email"},
+		{name: "invalid email", yaml: "vault_addr: http://vault:8200\nadmin_emails: [not-an-email]\n", wantErr: "invalid admin email"},
+		{name: "invalid low port", yaml: "vault_addr: http://vault:8200\nport: -1\nadmin_emails: [admin@example.com]\n", wantErr: "between 1 and 65535"},
+		{name: "invalid high port", yaml: "vault_addr: http://vault:8200\nport: 65536\nadmin_emails: [admin@example.com]\n", wantErr: "between 1 and 65535"},
+		{name: "legacy route prefix", yaml: "vault_addr: http://vault:8200\nadmin_emails: [admin@example.com]\npublic_routes: [/v1/auth/userpass/]\n", wantErr: "canonical absolute path"},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Create a temporary config file
-			tmpfile, err := os.CreateTemp("", "config-*.yaml")
-			if err != nil {
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("VAULT_PROXY_YAML", "")
+			configPath := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(configPath, []byte(test.yaml), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			defer os.Remove(tmpfile.Name())
-
-			if _, err := tmpfile.Write([]byte(tt.configYAML)); err != nil {
-				t.Fatal(err)
-			}
-			if err := tmpfile.Close(); err != nil {
-				t.Fatal(err)
-			}
-
-			config, err := loadConfig(tmpfile.Name())
-
-			if tt.expectError {
-				if err == nil {
-					t.Errorf("expected error containing %q, got nil", tt.errorMsg)
-				} else if tt.errorMsg != "" && !contains(err.Error(), tt.errorMsg) {
-					t.Errorf("expected error containing %q, got %q", tt.errorMsg, err.Error())
-				}
-			} else {
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-				}
-				if config == nil {
-					t.Error("expected config to be non-nil")
-				}
-				if config != nil && config.ListenPort == "" {
-					t.Error("expected ListenPort to have a default value")
-				}
-			}
-		})
-	}
-}
-
-func TestCreateProxyHandler_PublicRoutes(t *testing.T) {
-	// Create a mock Vault server
-	vaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("vault response"))
-	}))
-	defer vaultServer.Close()
-
-	vaultURL, _ := url.Parse(vaultServer.URL)
-	config := &Config{
-		VaultTargetURL: vaultURL,
-		PublicRoutes: []string{
-			"/.well-known/",
-			"/v1/auth/oidc/",
-		},
-		AdminEmails: map[string]bool{
-			"admin@example.com": true,
-		},
-		ListenPort: "8080",
-	}
-
-	handler := createProxyHandler(config)
-
-	tests := []struct {
-		name           string
-		path           string
-		expectedStatus int
-	}{
-		{"public well-known", "/.well-known/openid-configuration", http.StatusOK},
-		{"public auth oidc", "/v1/auth/oidc/login", http.StatusOK},
-		{"protected without token", "/v1/sys/health", http.StatusUnauthorized},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", tt.path, nil)
-			rr := httptest.NewRecorder()
-
-			handler.ServeHTTP(rr, req)
-
-			if rr.Code != tt.expectedStatus {
-				t.Errorf("handler returned wrong status code: got %v want %v",
-					rr.Code, tt.expectedStatus)
-			}
-		})
-	}
-}
-
-func TestCreateProxyHandler_MissingToken(t *testing.T) {
-	vaultURL, _ := url.Parse("http://localhost:8200")
-	config := &Config{
-		VaultTargetURL: vaultURL,
-		PublicRoutes:   []string{},
-		AdminEmails: map[string]bool{
-			"admin@example.com": true,
-		},
-		ListenPort: "8080",
-	}
-
-	handler := createProxyHandler(config)
-	req := httptest.NewRequest("GET", "/v1/sys/health", nil)
-	rr := httptest.NewRecorder()
-
-	handler.ServeHTTP(rr, req)
-
-	if rr.Code != http.StatusUnauthorized {
-		t.Errorf("expected status 401, got %d", rr.Code)
-	}
-
-	expectedBody := "Access Denied: Missing X-Admin-Token header"
-	if !contains(rr.Body.String(), expectedBody) {
-		t.Errorf("expected body to contain %q, got %q", expectedBody, rr.Body.String())
-	}
-}
-
-func TestCreateProxyHandler_TokenRemoved(t *testing.T) {
-	// Create a mock Vault server that checks headers
-	vaultServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify X-Admin-Token was removed
-		if r.Header.Get("X-Admin-Token") != "" {
-			t.Error("X-Admin-Token header should have been removed")
-		}
-		// Verify Authorization header is preserved
-		if r.Header.Get("Authorization") != "Bearer vault-token" {
-			t.Errorf("Authorization header not preserved: got %q", r.Header.Get("Authorization"))
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer vaultServer.Close()
-
-	// Create a mock tokeninfo server
-	tokeninfoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		response := TokenInfo{
-			Email:         "admin@example.com",
-			EmailVerified: "true",
-			ExpiresIn:     "3600",
-		}
-		_ = json.NewEncoder(w).Encode(response)
-	}))
-	defer tokeninfoServer.Close()
-
-	// We can't easily override the tokeninfo URL in validateAdminToken,
-	// so this test is limited. In production, you'd want to make the URL configurable.
-	// For now, we'll skip the full integration test and just verify the header removal logic
-	t.Skip("Integration test requires configurable tokeninfo endpoint")
-}
-
-func TestValidateAdminToken_Integration(t *testing.T) {
-	// This test would require either:
-	// 1. A real Google access token (not suitable for automated tests)
-	// 2. Mocking the HTTP client (requires refactoring validateAdminToken)
-	// 3. A test server that mimics Google's tokeninfo endpoint
-
-	// Create a mock tokeninfo server
-	tokeninfoServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if the request is to the tokeninfo endpoint
-		if !contains(r.URL.String(), "access_token=") {
-			http.Error(w, "missing access_token", http.StatusBadRequest)
-			return
-		}
-
-		token := r.URL.Query().Get("access_token")
-		switch token {
-		case "valid-token":
-			response := TokenInfo{
-				Email:         "admin@example.com",
-				EmailVerified: "true",
-				ExpiresIn:     "3600",
-			}
-			_ = json.NewEncoder(w).Encode(response)
-		case "invalid-email-token":
-			response := TokenInfo{
-				Email:         "notadmin@example.com",
-				EmailVerified: "true",
-				ExpiresIn:     "3600",
-			}
-			_ = json.NewEncoder(w).Encode(response)
-		case "unverified-token":
-			response := TokenInfo{
-				Email:         "admin@example.com",
-				EmailVerified: "false",
-				ExpiresIn:     "3600",
-			}
-			_ = json.NewEncoder(w).Encode(response)
-		default:
-			http.Error(w, "invalid token", http.StatusUnauthorized)
-		}
-	}))
-	defer tokeninfoServer.Close()
-
-	// Note: This test would require refactoring validateAdminToken to accept
-	// a custom HTTP client or tokeninfo URL. Skipping for now.
-	t.Skip("Requires refactoring validateAdminToken to be testable")
-}
-
-func TestValidateAdminIdentity(t *testing.T) {
-	adminEmails := map[string]bool{
-		"admin@example.com": true,
-		"api-production@libops-api.iam.gserviceaccount.com": true,
-	}
-
-	tests := []struct {
-		name        string
-		tokenInfo   TokenInfo
-		expectError bool
-		errorMsg    string
-	}{
-		{
-			name: "verified admin user",
-			tokenInfo: TokenInfo{
-				Email:         "admin@example.com",
-				EmailVerified: "true",
-			},
-			expectError: false,
-		},
-		{
-			name: "unverified admin user",
-			tokenInfo: TokenInfo{
-				Email:         "admin@example.com",
-				EmailVerified: "false",
-			},
-			expectError: true,
-			errorMsg:    "email not verified",
-		},
-		{
-			name: "unverified admin service account",
-			tokenInfo: TokenInfo{
-				Email:         "api-production@libops-api.iam.gserviceaccount.com",
-				EmailVerified: "false",
-			},
-			expectError: false,
-		},
-		{
-			name: "unverified non-admin service account",
-			tokenInfo: TokenInfo{
-				Email:         "other@libops-api.iam.gserviceaccount.com",
-				EmailVerified: "false",
-			},
-			expectError: true,
-			errorMsg:    "non-admin hitting protected route",
-		},
-		{
-			name: "missing email",
-			tokenInfo: TokenInfo{
-				EmailVerified: "true",
-			},
-			expectError: true,
-			errorMsg:    "token email missing",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := validateAdminIdentity(tt.tokenInfo, adminEmails)
-			if tt.expectError {
-				if err == nil {
-					t.Fatalf("expected error containing %q, got nil", tt.errorMsg)
-				}
-				if tt.errorMsg != "" && !contains(err.Error(), tt.errorMsg) {
-					t.Fatalf("expected error containing %q, got %q", tt.errorMsg, err.Error())
+			config, err := loadConfig(configPath)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("loadConfig() error = %v, want substring %q", err, test.wantErr)
 				}
 				return
 			}
 			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+				t.Fatal(err)
+			}
+			if config.ListenPort != test.wantPort {
+				t.Errorf("ListenPort = %d, want %d", config.ListenPort, test.wantPort)
+			}
+			if len(config.AdminEmails) != test.wantAdmins {
+				t.Errorf("admin count = %d, want %d", len(config.AdminEmails), test.wantAdmins)
 			}
 		})
 	}
 }
 
-func TestMapsKeys(t *testing.T) {
+func TestLoadConfigEnvironmentTakesPrecedence(t *testing.T) {
+	t.Setenv("VAULT_PROXY_YAML", "vault_addr: http://env-vault:8200\nadmin_emails: [admin@example.com]\n")
+	config, err := loadConfig(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.VaultTargetURL.Host != "env-vault:8200" {
+		t.Fatalf("target = %q, want env-vault:8200", config.VaultTargetURL.Host)
+	}
+}
+
+func TestGoogleTokenValidator(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("access_token") != "valid-token" {
+			http.Error(w, "rejected", http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(TokenInfo{Email: "ADMIN@example.com", EmailVerified: "true"})
+	}))
+	defer server.Close()
+
+	validator := googleTokenValidator{client: server.Client(), endpoint: server.URL}
+	admins := map[string]struct{}{"admin@example.com": {}}
+	if err := validator.Validate(context.Background(), "valid-token", admins); err != nil {
+		t.Fatalf("valid token rejected: %v", err)
+	}
+	if err := validator.Validate(context.Background(), "invalid-token", admins); err == nil {
+		t.Fatal("invalid token accepted")
+	}
+}
+
+func TestGoogleTokenValidatorTransportErrorRedactsToken(t *testing.T) {
+	const token = "secret-google-access-token"
+	validator := googleTokenValidator{
+		client: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return nil, fmt.Errorf("request to %s failed", request.URL.String())
+		})},
+		endpoint: "https://oauth2.googleapis.com/tokeninfo",
+	}
+
+	err := validator.Validate(context.Background(), token, map[string]struct{}{"admin@example.com": {}})
+	if err == nil {
+		t.Fatal("transport failure accepted")
+	}
+	if strings.Contains(err.Error(), token) || strings.Contains(err.Error(), "access_token=") {
+		t.Fatalf("validator error exposed token-bearing URL: %q", err)
+	}
+}
+
+func TestValidateAdminIdentity(t *testing.T) {
+	admins := map[string]struct{}{
+		"admin@example.com": {},
+		"api-production@libops-api.iam.gserviceaccount.com": {},
+	}
 	tests := []struct {
-		name     string
-		input    map[string]bool
-		expected int
+		name string
+		info TokenInfo
+		ok   bool
 	}{
-		{"empty map", map[string]bool{}, 0},
-		{"single key", map[string]bool{"admin@example.com": true}, 1},
-		{"multiple keys", map[string]bool{
-			"admin@example.com": true,
-			"ops@example.com":   true,
-			"dev@example.com":   true,
-		}, 3},
+		{"verified user", TokenInfo{Email: "ADMIN@example.com", EmailVerified: "true"}, true},
+		{"unverified user", TokenInfo{Email: "admin@example.com", EmailVerified: "false"}, false},
+		{"unverified service account", TokenInfo{Email: "api-production@libops-api.iam.gserviceaccount.com", EmailVerified: "false"}, false},
+		{"unknown user", TokenInfo{Email: "other@example.com", EmailVerified: "true"}, false},
+		{"missing email", TokenInfo{EmailVerified: "true"}, false},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := mapsKeys(tt.input)
-			if len(result) != tt.expected {
-				t.Errorf("mapsKeys returned %d keys, expected %d", len(result), tt.expected)
-			}
-
-			// Verify all keys are present
-			for key := range tt.input {
-				found := false
-				for _, k := range result {
-					if k == key {
-						found = true
-						break
-					}
-				}
-				if !found {
-					t.Errorf("key %q not found in result", key)
-				}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateAdminIdentity(test.info, admins)
+			if (err == nil) != test.ok {
+				t.Fatalf("validateAdminIdentity() error = %v, ok want %v", err, test.ok)
 			}
 		})
 	}
 }
 
-// Helper function
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && stringContains(s, substr)))
+func TestProxyHandlerPublicRouteStripsAdminCredential(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("X-Admin-Token"); got != "" {
+			t.Errorf("upstream received X-Admin-Token %q", got)
+		}
+		if got := r.Header.Get("X-Vault-Token"); got != "vault-token" {
+			t.Errorf("upstream X-Vault-Token = %q", got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer vault-credential" {
+			t.Errorf("upstream Authorization = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := createProxyHandlerWithValidator(testConfig(t, upstream.URL, []string{"/v1/sys/health"}), tokenValidatorFunc(func(context.Context, string, map[string]struct{}) error {
+		t.Fatal("validator called for public route")
+		return nil
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/v1/sys/health", nil)
+	req.Header.Set("X-Admin-Token", "google-token")
+	req.Header.Set("X-Vault-Token", "vault-token")
+	req.Header.Set("Authorization", "Bearer vault-credential")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, req)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
 }
 
-func stringContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
+func TestProxyHandlerProtectsManagementRoutes(t *testing.T) {
+	upstreamCalls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		upstreamCalls++
+	}))
+	defer upstream.Close()
+
+	handler := createProxyHandlerWithValidator(testConfig(t, upstream.URL, []string{"/v1/auth/userpass/login/**"}), tokenValidatorFunc(func(context.Context, string, map[string]struct{}) error {
+		return nil
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v1/auth/userpass/users/alice", nil))
+	if response.Code != http.StatusUnauthorized || strings.TrimSpace(response.Body.String()) != "Unauthorized" {
+		t.Fatalf("response = %d %q, want generic 401", response.Code, response.Body.String())
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("upstream called %d times", upstreamCalls)
+	}
+}
+
+func TestProxyHandlerProtectedRoute(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Admin-Token") != "" {
+			t.Error("admin token leaked upstream")
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+
+	validator := tokenValidatorFunc(func(_ context.Context, token string, admins map[string]struct{}) error {
+		if token != "allowed" {
+			return errors.New("denied detail that must stay internal")
+		}
+		if _, ok := admins["admin@example.com"]; !ok {
+			t.Error("admin allowlist missing")
+		}
+		return nil
+	})
+	handler := createProxyHandlerWithValidator(testConfig(t, upstream.URL, nil), validator)
+
+	for _, test := range []struct {
+		token string
+		want  int
+	}{
+		{"", http.StatusUnauthorized},
+		{"denied", http.StatusUnauthorized},
+		{"allowed", http.StatusAccepted},
+	} {
+		response := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/v1/sys/config/state", nil)
+		if test.token != "" {
+			req.Header.Set("X-Admin-Token", test.token)
+		}
+		handler.ServeHTTP(response, req)
+		if response.Code != test.want {
+			t.Errorf("token %q: status = %d, want %d", test.token, response.Code, test.want)
+		}
+		if test.want == http.StatusUnauthorized && strings.Contains(response.Body.String(), "denied detail") {
+			t.Error("internal validation detail leaked to caller")
 		}
 	}
-	return false
+}
+
+func TestProxyHandlerRedactsValidatorErrorsFromLogs(t *testing.T) {
+	const sensitiveDetail = "secret-google-access-token"
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("denied request reached Vault")
+	}))
+	defer upstream.Close()
+
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	defer slog.SetDefault(previousLogger)
+
+	handler := createProxyHandlerWithValidator(testConfig(t, upstream.URL, nil), tokenValidatorFunc(func(context.Context, string, map[string]struct{}) error {
+		return errors.New(sensitiveDetail)
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/v1/sys/config/state", nil)
+	request.Header.Set("X-Admin-Token", sensitiveDetail)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if strings.Contains(logs.String(), sensitiveDetail) {
+		t.Fatalf("logs exposed validator credential: %q", logs.String())
+	}
+}
+
+func TestProxyHandlerRemovesSpoofedForwardingHeaders(t *testing.T) {
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		for _, header := range []string{
+			"Forwarded",
+			"X-Forwarded-For",
+			"X-Forwarded-Host",
+			"X-Forwarded-Port",
+			"X-Forwarded-Proto",
+			"X-Real-IP",
+		} {
+			if values := request.Header.Values(header); len(values) != 0 {
+				t.Errorf("upstream received spoofable %s header %q", header, values)
+			}
+		}
+		if request.Host != strings.TrimPrefix(upstream.URL, "http://") {
+			t.Errorf("upstream Host = %q, want target host", request.Host)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	handler := createProxyHandlerWithValidator(testConfig(t, upstream.URL, []string{"/v1/sys/health"}), tokenValidatorFunc(func(context.Context, string, map[string]struct{}) error {
+		t.Fatal("validator called for public route")
+		return nil
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/v1/sys/health", nil)
+	request.Header.Set("Forwarded", "for=198.51.100.10;host=attacker.example;proto=https")
+	request.Header.Set("X-Forwarded-For", "198.51.100.10")
+	request.Header.Set("X-Forwarded-Host", "attacker.example")
+	request.Header.Set("X-Forwarded-Port", "443")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Real-IP", "198.51.100.10")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+}
+
+func TestProxyHealthEndpointDoesNotReachVault(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("healthz reached Vault")
+	}))
+	defer upstream.Close()
+	handler := createProxyHandlerWithValidator(testConfig(t, upstream.URL, nil), tokenValidatorFunc(func(context.Context, string, map[string]struct{}) error {
+		t.Fatal("healthz invoked token validator")
+		return nil
+	}))
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+}
+
+func testConfig(t *testing.T, upstream string, routes []string) *Config {
+	t.Helper()
+	target, err := url.Parse(upstream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &Config{
+		VaultTargetURL: target,
+		PublicRoutes:   routes,
+		AdminEmails:    map[string]struct{}{"admin@example.com": {}},
+		ListenPort:     8080,
+	}
 }
