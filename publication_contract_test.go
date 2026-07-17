@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-const sharedWorkflowSHA = "578137212ead4ab4059e95df17fa30e9b7ac4aed"
+const sharedWorkflowSHA = "d5a29840172a53729c5999832534de65b7ba9587"
 
 func readPublicationFile(t *testing.T, path string) string {
 	t.Helper()
