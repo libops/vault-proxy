@@ -6,7 +6,10 @@ import (
 	"testing"
 )
 
-const sharedWorkflowSHA = "d5a29840172a53729c5999832534de65b7ba9587"
+const (
+	sharedPublisherSHA = "578137212ead4ab4059e95df17fa30e9b7ac4aed"
+	sharedWorkflowSHA  = "d5a29840172a53729c5999832534de65b7ba9587"
+)
 
 func readPublicationFile(t *testing.T, path string) string {
 	t.Helper()
@@ -20,12 +23,12 @@ func readPublicationFile(t *testing.T, path string) string {
 func TestPublicationUsesReviewedSharedWorkflows(t *testing.T) {
 	publisher := readPublicationFile(t, ".github/workflows/lint-test-build-push.yaml")
 	for _, required := range []string{
-		"libops/.github/.github/workflows/build-push.yaml@" + sharedWorkflowSHA,
+		"libops/.github/.github/workflows/build-push.yaml@" + sharedPublisherSHA,
 		"additional-gar-registry: us-docker.pkg.dev/libops-images/public",
 		"expected-main-sha:",
 		"scan: true",
 		"sign: true",
-		"certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@" + sharedWorkflowSHA,
+		"certificate-identity: https://github.com/libops/.github/.github/workflows/build-push.yaml@" + sharedPublisherSHA,
 	} {
 		if !strings.Contains(publisher, required) {
 			t.Errorf("publisher workflow must contain %q", required)
