@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,6 +19,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,20 +30,26 @@ const (
 	defaultListenPort = 8080
 	// #nosec G101 -- this is Google's public token-inspection endpoint, not a credential.
 	defaultTokenInfoURL = "https://oauth2.googleapis.com/tokeninfo"
-	maxTokenInfoBody    = 1 << 20
+	// #nosec G101 -- this is the documented metadata identity endpoint, not a credential.
+	defaultMetadataIdentityURL = "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+	maxTokenInfoBody           = 1 << 20
+	maxIdentityTokenBody       = 64 << 10
+	identityTokenRefreshSkew   = 5 * time.Minute
 )
 
 // YAMLConfig represents the supported configuration file fields.
 type YAMLConfig struct {
-	VaultAddr    string   `yaml:"vault_addr"`
-	Port         int      `yaml:"port"`
-	AdminEmails  []string `yaml:"admin_emails"`
-	PublicRoutes []string `yaml:"public_routes"`
+	VaultAddr     string   `yaml:"vault_addr"`
+	VaultAudience string   `yaml:"vault_audience"`
+	Port          int      `yaml:"port"`
+	AdminEmails   []string `yaml:"admin_emails"`
+	PublicRoutes  []string `yaml:"public_routes"`
 }
 
 // Config is the validated runtime configuration.
 type Config struct {
 	VaultTargetURL *url.URL
+	VaultAudience  string
 	PublicRoutes   []string
 	AdminEmails    map[string]struct{}
 	ListenPort     int
@@ -61,6 +69,24 @@ type tokenValidator interface {
 type googleTokenValidator struct {
 	client   *http.Client
 	endpoint string
+}
+
+type identityTokenProvider interface {
+	Token(context.Context, string) (string, error)
+}
+
+type metadataIdentityTokenProvider struct {
+	client    *http.Client
+	endpoint  string
+	mu        sync.Mutex
+	token     string
+	expiresAt time.Time
+}
+
+type identityTokenTransport struct {
+	base     http.RoundTripper
+	provider identityTokenProvider
+	audience string
 }
 
 func loadYAMLConfig(configPath string) (*YAMLConfig, error) {
@@ -106,6 +132,10 @@ func loadConfig(configPath string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	vaultAudience, err := validateVaultAudience(yamlConfig.VaultAudience, targetURL)
+	if err != nil {
+		return nil, err
+	}
 
 	adminEmails := make(map[string]struct{}, len(yamlConfig.AdminEmails))
 	for _, configuredEmail := range yamlConfig.AdminEmails {
@@ -136,10 +166,34 @@ func loadConfig(configPath string) (*Config, error) {
 
 	return &Config{
 		VaultTargetURL: targetURL,
+		VaultAudience:  vaultAudience,
 		PublicRoutes:   append([]string(nil), yamlConfig.PublicRoutes...),
 		AdminEmails:    adminEmails,
 		ListenPort:     port,
 	}, nil
+}
+
+func validateVaultAudience(rawAudience string, targetURL *url.URL) (string, error) {
+	if rawAudience == "" {
+		return "", nil
+	}
+	if strings.TrimSpace(rawAudience) != rawAudience {
+		return "", errors.New("vault_audience must not contain leading or trailing whitespace")
+	}
+	audience, err := url.Parse(rawAudience)
+	if err != nil {
+		return "", fmt.Errorf("invalid vault_audience: %w", err)
+	}
+	if audience.Scheme != "https" || audience.Host == "" {
+		return "", errors.New("vault_audience must be an absolute HTTPS service URL")
+	}
+	if audience.User != nil || audience.RawQuery != "" || audience.Fragment != "" || (audience.Path != "" && audience.Path != "/") {
+		return "", errors.New("vault_audience must not contain credentials, a path, query, or fragment")
+	}
+	if targetURL.Scheme != "https" {
+		return "", errors.New("vault_addr must use HTTPS when vault_audience enables upstream identity")
+	}
+	return strings.TrimSuffix(rawAudience, "/"), nil
 }
 
 func validateVaultURL(rawURL string) (*url.URL, error) {
@@ -265,6 +319,97 @@ func normalizeEmail(email string) string {
 	return strings.ToLower(strings.TrimSpace(email))
 }
 
+func (provider *metadataIdentityTokenProvider) Token(ctx context.Context, audience string) (string, error) {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+
+	if provider.token != "" && time.Until(provider.expiresAt) > identityTokenRefreshSkew {
+		return provider.token, nil
+	}
+	endpoint, err := url.Parse(provider.endpoint)
+	if err != nil {
+		return "", errors.New("metadata identity endpoint is misconfigured")
+	}
+	query := endpoint.Query()
+	query.Set("audience", audience)
+	query.Set("format", "full")
+	endpoint.RawQuery = query.Encode()
+
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return "", errors.New("create metadata identity request failed")
+	}
+	request.Header.Set("Metadata-Flavor", "Google")
+	response, err := provider.client.Do(request)
+	if err != nil {
+		return "", errors.New("metadata identity request failed")
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata identity request returned status %d", response.StatusCode)
+	}
+	tokenBytes, err := io.ReadAll(io.LimitReader(response.Body, maxIdentityTokenBody+1))
+	if err != nil {
+		return "", errors.New("read metadata identity response failed")
+	}
+	if len(tokenBytes) == 0 || len(tokenBytes) > maxIdentityTokenBody {
+		return "", errors.New("metadata identity response has an invalid size")
+	}
+	token := strings.TrimSpace(string(tokenBytes))
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return "", errors.New("metadata identity response is not a token")
+	}
+	expiresAt, err := identityTokenExpiry(token)
+	if err != nil {
+		return "", err
+	}
+	if time.Until(expiresAt) <= 0 {
+		return "", errors.New("metadata identity token is already expired")
+	}
+	provider.token = token
+	provider.expiresAt = expiresAt
+	return token, nil
+}
+
+func identityTokenExpiry(token string) (time.Time, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, errors.New("metadata identity response is not a JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, errors.New("metadata identity JWT payload is invalid")
+	}
+	var claims struct {
+		ExpiresAt json.Number `json:"exp"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	if err := decoder.Decode(&claims); err != nil {
+		return time.Time{}, errors.New("metadata identity JWT claims are invalid")
+	}
+	expiry, err := claims.ExpiresAt.Int64()
+	if err != nil || expiry <= 0 {
+		return time.Time{}, errors.New("metadata identity JWT expiration is invalid")
+	}
+	return time.Unix(expiry, 0), nil
+}
+
+func (transport *identityTokenTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	token, err := transport.provider.Token(request.Context(), transport.audience)
+	if err != nil {
+		return nil, fmt.Errorf("authorize Vault upstream: %w", err)
+	}
+	outbound := request.Clone(request.Context())
+	outbound.Header = request.Header.Clone()
+	outbound.Header.Set("X-Serverless-Authorization", "Bearer "+token)
+	base := transport.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(outbound)
+}
+
 func createProxyHandler(config *Config) http.Handler {
 	validator := googleTokenValidator{
 		client:   &http.Client{Timeout: 10 * time.Second},
@@ -274,7 +419,37 @@ func createProxyHandler(config *Config) http.Handler {
 }
 
 func createProxyHandlerWithValidator(config *Config, validator tokenValidator) http.Handler {
+	identityProvider := &metadataIdentityTokenProvider{
+		client:   newMetadataIdentityHTTPClient(),
+		endpoint: defaultMetadataIdentityURL,
+	}
+	return createProxyHandlerWithDependencies(config, validator, identityProvider)
+}
+
+func newMetadataIdentityHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		// The metadata endpoint is necessarily link-local plain HTTP. Never let
+		// environment proxy settings observe the returned service identity token.
+		Transport: &http.Transport{
+			Proxy:             nil,
+			DisableKeepAlives: true,
+		},
+	}
+}
+
+func createProxyHandlerWithDependencies(config *Config, validator tokenValidator, identityProvider identityTokenProvider) http.Handler {
 	proxy := &httputil.ReverseProxy{}
+	if config.VaultAudience != "" {
+		proxy.Transport = &identityTokenTransport{
+			base:     http.DefaultTransport,
+			provider: identityProvider,
+			audience: config.VaultAudience,
+		}
+	}
 	proxy.Rewrite = func(request *httputil.ProxyRequest) {
 		// Rewrite mode removes the standard client-provided Forwarded and
 		// X-Forwarded-* values before this function runs. Remove extensions as
@@ -282,7 +457,7 @@ func createProxyHandlerWithValidator(config *Config, validator tokenValidator) h
 		// audit decisions using an attacker-supplied client IP, host, or scheme.
 		for header := range request.Out.Header {
 			normalized := strings.ToLower(header)
-			if normalized == "forwarded" || normalized == "x-real-ip" || strings.HasPrefix(normalized, "x-forwarded-") {
+			if normalized == "forwarded" || normalized == "x-real-ip" || normalized == "x-serverless-authorization" || strings.HasPrefix(normalized, "x-forwarded-") {
 				request.Out.Header.Del(header)
 			}
 		}

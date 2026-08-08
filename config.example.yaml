@@ -1,4 +1,9 @@
 vault_addr: http://127.0.0.1:8200
+# For a separate, IAM-protected Cloud Run Vault service, use its HTTPS URL for
+# both fields. The proxy fetches a short-lived ID token from the metadata server
+# and sends it in X-Serverless-Authorization without replacing Vault's own
+# Authorization header.
+# vault_audience: https://vault-runtime-example.run.app
 port: 8080
 admin_emails:
   - me@example.com

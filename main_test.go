@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type tokenValidatorFunc func(context.Context, string, map[string]struct{}) error
@@ -26,6 +28,12 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+type identityTokenProviderFunc func(context.Context, string) (string, error)
+
+func (fn identityTokenProviderFunc) Token(ctx context.Context, audience string) (string, error) {
+	return fn(ctx, audience)
 }
 
 func TestIsPublicRoute(t *testing.T) {
@@ -112,10 +120,22 @@ admin_emails: [admin@example.com]
 			wantPort:   8443,
 			wantAdmins: 1,
 		},
+		{
+			name: "private upstream audience",
+			yaml: `vault_addr: https://vault-runtime.example.run.app
+vault_audience: https://vault-runtime.example.run.app
+admin_emails: [admin@example.com]
+`,
+			wantPort:   8080,
+			wantAdmins: 1,
+		},
 		{name: "unknown field", yaml: "vault_addr: http://vault:8200\nadmin_emails: [admin@example.com]\nsurprise: true\n", wantErr: "field surprise not found"},
 		{name: "relative URL", yaml: "vault_addr: vault:8200\nadmin_emails: [admin@example.com]\n", wantErr: "must use http or https"},
 		{name: "URL credentials", yaml: "vault_addr: https://user:pass@vault.example.com\nadmin_emails: [admin@example.com]\n", wantErr: "must not contain credentials"},
 		{name: "URL path", yaml: "vault_addr: https://vault.example.com/v1\nadmin_emails: [admin@example.com]\n", wantErr: "must not contain a path"},
+		{name: "audience with plaintext upstream", yaml: "vault_addr: http://vault:8200\nvault_audience: https://vault.example.run.app\nadmin_emails: [admin@example.com]\n", wantErr: "must use HTTPS"},
+		{name: "audience path", yaml: "vault_addr: https://vault.example.run.app\nvault_audience: https://vault.example.run.app/path\nadmin_emails: [admin@example.com]\n", wantErr: "must not contain credentials, a path"},
+		{name: "audience credentials", yaml: "vault_addr: https://vault.example.run.app\nvault_audience: https://user@example.run.app\nadmin_emails: [admin@example.com]\n", wantErr: "must not contain credentials"},
 		{name: "empty admins", yaml: "vault_addr: http://vault:8200\nadmin_emails: ['   ']\n", wantErr: "invalid admin email"},
 		{name: "invalid email", yaml: "vault_addr: http://vault:8200\nadmin_emails: [not-an-email]\n", wantErr: "invalid admin email"},
 		{name: "invalid low port", yaml: "vault_addr: http://vault:8200\nport: -1\nadmin_emails: [admin@example.com]\n", wantErr: "between 1 and 65535"},
@@ -147,6 +167,97 @@ admin_emails: [admin@example.com]
 				t.Errorf("admin count = %d, want %d", len(config.AdminEmails), test.wantAdmins)
 			}
 		})
+	}
+}
+
+func TestMetadataIdentityTokenProviderCachesValidToken(t *testing.T) {
+	expires := time.Now().Add(time.Hour).Unix()
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, expires)))
+	token := "header." + payload + ".signature"
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		calls++
+		if request.Header.Get("Metadata-Flavor") != "Google" {
+			t.Error("metadata request omitted Metadata-Flavor")
+		}
+		if request.URL.Query().Get("audience") != "https://vault-runtime.example.run.app" || request.URL.Query().Get("format") != "full" {
+			t.Errorf("metadata query = %q", request.URL.RawQuery)
+		}
+		_, _ = w.Write([]byte(token))
+	}))
+	defer server.Close()
+
+	provider := &metadataIdentityTokenProvider{client: server.Client(), endpoint: server.URL}
+	for range 2 {
+		got, err := provider.Token(context.Background(), "https://vault-runtime.example.run.app")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != token {
+			t.Fatalf("token = %q, want test token", got)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("metadata calls = %d, want one cached fetch", calls)
+	}
+}
+
+func TestMetadataIdentityClientRejectsProxyAndRedirects(t *testing.T) {
+	client := newMetadataIdentityHTTPClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T", client.Transport)
+	}
+	if transport.Proxy != nil || !transport.DisableKeepAlives {
+		t.Fatal("metadata identity client permits a proxy or reusable plaintext connection")
+	}
+	if client.CheckRedirect == nil || !errors.Is(client.CheckRedirect(nil, nil), http.ErrUseLastResponse) {
+		t.Fatal("metadata identity client permits redirects")
+	}
+}
+
+func TestIdentityTokenExpiryRejectsMalformedTokens(t *testing.T) {
+	for _, token := range []string{"", "one.two", "one.%%%25.three", "one.e30.three"} {
+		if _, err := identityTokenExpiry(token); err == nil {
+			t.Errorf("identityTokenExpiry(%q) accepted malformed token", token)
+		}
+	}
+}
+
+func TestProxyAddsUpstreamIdentityWithoutReplacingVaultAuthorization(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("X-Serverless-Authorization"); got != "Bearer runtime-id-token" {
+			t.Errorf("X-Serverless-Authorization = %q", got)
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer vault-client-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+
+	config := testConfig(t, upstream.URL, []string{"/v1/sys/health"})
+	config.VaultAudience = "https://vault-runtime.example.run.app"
+	handler := createProxyHandlerWithDependencies(
+		config,
+		tokenValidatorFunc(func(context.Context, string, map[string]struct{}) error {
+			t.Fatal("validator called for public route")
+			return nil
+		}),
+		identityTokenProviderFunc(func(_ context.Context, audience string) (string, error) {
+			if audience != config.VaultAudience {
+				t.Fatalf("audience = %q", audience)
+			}
+			return "runtime-id-token", nil
+		}),
+	)
+	request := httptest.NewRequest(http.MethodGet, "/v1/sys/health", nil)
+	request.Header.Set("Authorization", "Bearer vault-client-token")
+	request.Header.Set("X-Serverless-Authorization", "Bearer attacker-token")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
 	}
 }
 
@@ -356,6 +467,7 @@ func TestProxyHandlerRemovesSpoofedForwardingHeaders(t *testing.T) {
 			"X-Forwarded-Port",
 			"X-Forwarded-Proto",
 			"X-Real-IP",
+			"X-Serverless-Authorization",
 		} {
 			if values := request.Header.Values(header); len(values) != 0 {
 				t.Errorf("upstream received spoofable %s header %q", header, values)
@@ -379,6 +491,7 @@ func TestProxyHandlerRemovesSpoofedForwardingHeaders(t *testing.T) {
 	request.Header.Set("X-Forwarded-Port", "443")
 	request.Header.Set("X-Forwarded-Proto", "https")
 	request.Header.Set("X-Real-IP", "198.51.100.10")
+	request.Header.Set("X-Serverless-Authorization", "Bearer attacker-token")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 

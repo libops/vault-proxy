@@ -1,9 +1,11 @@
 # Vault proxy
 
-Vault proxy is the public Cloud Run sidecar for the LibOps Vault service. Vault
+Vault proxy is the public request boundary for the LibOps Vault service. Vault
 continues to authorize every Vault token and policy; the proxy adds a Google
 administrator check to routes that are not explicitly required by customer
-authentication or secret access flows.
+authentication or secret access flows. Production runs the proxy and Vault as
+separate Cloud Run services and service identities so this public process does
+not inherit Vault's storage or KMS authority.
 
 ## Request policy
 
@@ -48,6 +50,25 @@ public_routes:
   - /v1/auth/userpass/login/**
   - /v1/sys/health
 ```
+
+The localhost form is useful only for development or legacy sidecar use. For a
+separate IAM-protected Cloud Run upstream, configure both fields with the
+runtime service's default HTTPS URL:
+
+```yaml
+vault_addr: https://vault-runtime-example.run.app
+vault_audience: https://vault-runtime-example.run.app
+```
+
+When `vault_audience` is set, the upstream must use HTTPS. The proxy fetches a
+short-lived Google-signed ID token from the Cloud Run metadata server, caches it
+only until shortly before expiration, and sends it in
+`X-Serverless-Authorization`. That header lets Cloud Run authenticate the proxy
+identity while preserving a client's separate `Authorization` or
+`X-Vault-Token` credential for Vault. Caller-supplied forwarding and
+`X-Serverless-Authorization` headers are stripped before the proxy creates its
+own upstream request. The proxy identity needs only `roles/run.invoker` on the
+Vault runtime; it needs no Vault data-bucket or KMS role.
 
 The example patterns permit OIDC discovery/exchange and user login while
 leaving role, provider, user, policy, and system management protected. Add
