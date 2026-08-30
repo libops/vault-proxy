@@ -1,4 +1,4 @@
-FROM ghcr.io/libops/go:1.26.5@sha256:ea764e85e42a243217c621891123b3fda9374674c29d59785414fc6b15815b3d AS builder
+FROM ghcr.io/libops/go:1.26.6 AS builder
 
 WORKDIR /src
 
