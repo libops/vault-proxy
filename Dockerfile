@@ -1,4 +1,4 @@
-FROM ghcr.io/libops/go:1.26.5 AS builder
+FROM ghcr.io/libops/go:1.26.6 AS builder
 
 WORKDIR /src
 
